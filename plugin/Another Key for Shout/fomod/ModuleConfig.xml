@@ -1,0 +1,28 @@
+<config>
+	<moduleName>Another Key for Shout (AKFS)</moduleName>
+	<installSteps order="Explicit">
+		<installStep name="Interface Language">
+			<optionalFileGroups order="Explicit">
+				<group name="Language" type="SelectExactlyOne">
+					<plugins order="Explicit">
+						<plugin name="简体中文">
+							<description>中文界面提示（默认）。</description>
+							<files>
+								<file source="Language/Chinese/AKFS.ini" destination="/SKSE/Plugins/AKFS.ini"/>
+							</files>
+						</plugin>
+						<plugin name="English">
+							<description>English on-screen notifications.</description>
+							<files>
+								<file source="Language/English/AKFS.ini" destination="/SKSE/Plugins/AKFS.ini"/>
+							</files>
+						</plugin>
+					</plugins>
+				</group>
+			</optionalFileGroups>
+		</installStep>
+	</installSteps>
+	<requiredInstallFiles>
+		<file source="AKFS.dll" destination="/SKSE/Plugins/AKFS.dll"/>
+	</requiredInstallFiles>
+</config>
