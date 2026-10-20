@@ -13,7 +13,7 @@ E:\SE mod\
 ├── thirdparty\      ✅ spdlog / CommonLibSSE-NG / rapidcsv
 ├── scripts\         ✅ build_spdlog.ps1
 ├── src\             ✅ main.cpp / Version.cpp / SecondSlotManager.{h,cpp} / MenuMouseIntercept.{h,cpp}
-└── build\out\Release\ ✅ SEMod.dll
+└── build\out\Release\ ✅ AKFS.dll
 ```
 
 ## 代码实体

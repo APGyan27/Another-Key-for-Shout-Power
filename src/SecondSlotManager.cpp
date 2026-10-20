@@ -89,8 +89,13 @@ namespace SEMod
     namespace
     {
         constexpr float kPowerRecoveryTime = 3.0F;              // 力量固定冷却（秒）
+        // ⚠️ v1.11 已删除 kShoutCdStuckLimit：日志证明 voiceRecoveryTime 一直真实且会自动递减，
+        //   "假冷却/卡死"是 v1.5 基于错误观察发明的概念，整套自愈与阈值判定已一并移除。
+        //   龙吼冷却现在只有一条规则：>0 就拦（只读，不写任何值）。
         constexpr auto  kShoutRestoreMinHold = std::chrono::milliseconds(300);   // pending 最短保持（防过早归零处理）
         constexpr auto  kMaxShoutRestoreWait = std::chrono::milliseconds(3000);  // pending 硬上限（voiceState 万一不归零的兜底）
+        // v1.12 可靠还原协议：还原后回读校验失败时的最大重传次数。超过则告警放弃（不无限占用）。
+        constexpr std::uint32_t kRestoreMaxRetries = 8;
 
         // 按 [Lang] 语言出提示：中文 / English（Fallback：读不到配置则中文）。
         void NotifyLocalized(const char* a_cn, const char* a_en)
@@ -343,26 +348,24 @@ namespace SEMod
         if (!player)
             return false;
         if (m_secondSlot && m_secondSlot->As<RE::TESShout>()) {
+            // ⚠️ v1.11「只拦不清」——一条 if 同时解决两个 bug：
+            //
+            //   ① X 键龙吼无冷却：v1.5 曾把"插件空闲且 voiceRecoveryTime>0"判为"假冷却"清零放行，
+            //      但**插件空闲恰恰是冷却正常进行的全部时段**（施放已结束、槽已还原）→ 每段真冷却
+            //      开场即被清掉。日志实锤（2026-10-20）：18:24:32 写完 35.65s，18:25:12 自然归零，
+            //      证明这个值一直是真实且会自动递减的，"假冷却"这个概念本身是错误观察的产物。
+            //      故彻底删除清零与"自愈"，只保留拦截。
+            //
+            //   ② Z 槽被篡改成 X 槽龙吼：BeginNativeShout 是**先换槽、后喂 Z 键事件**，
+            //      而 CanProcess 实测不做冷却检查（日志 8/8 返回 true，含 16.19s/33.92s/27.25s
+            //      冷却中），ProcessButton 拒绝时槽已经换出去了且无还原路径 → 永久污染 Z 槽。
+            //      在这里于**换槽之前**拦住，槽就不会被碰。
+            //
+            //   ⚠️ 本分支**一个引擎字段都不写**：voiceRecoveryTime 完全由引擎维护（含属性加成），
+            //      插件只做只读判断。也绝不触碰 voiceState（铁律）。
             const float remain = player->GetVoiceRecoveryTime();
             if (remain > 0.0F) {
-                // ⚠️ v1.5 残留自愈：龙吼施放后引擎 voiceRecoveryTime 正常恒为 0（18:55 全程实测）。
-                //   "用久了"无法释放 = 某次异步施放让引擎残留 voiceRecoveryTime>0 且未归零 → 恒拦。
-                //   引擎的 voice 冷却只在它自己施放通道才推进/归零；我们的 X 施放(CastSpellImmediate/
-                //   BeginNativeShout 注入)引擎并不主动清它。故只要插件**当前不处于施放龙吼中**
-                //   (m_shoutActive/m_restorePending 均 false)，残留的 voice 冷却就是无效垃圾。
-                //   此时允许施放并把残留归零，避免"永久锁死"。绝不写 voiceState（铁律），只清 recoveryTime。
-                if (!m_shoutActive && !m_restorePending) {
-                    SKSE::log::warn("AKFS: [cd] 龙吼槽 voiceRecoveryTime 残留 {:.3f}s 且插件空闲，判定为垃圾冷却，归零放行",
-                                    remain);
-                    // 直接清 high->voiceRecoveryTime（无 Set 方法；它只是 HighProcessData 成员 0x018）。
-                    // ⚠️ 只清 recoveryTime，绝不写 voiceState（铁律）。
-                    auto& prt = player->GetActorRuntimeData();
-                    if (prt.currentProcess && prt.currentProcess->high)
-                        prt.currentProcess->high->voiceRecoveryTime = 0.0F;
-                    return false;
-                }
-                // 插件自身仍在施放龙吼（pending 未还原）：真冷却，拦截。
-                SKSE::log::info("AKFS: [cd] 龙吼槽被 voice 冷却拦截 remain={:.3f}s", remain);
+                SKSE::log::info("AKFS: [cd] 龙吼冷却中 remain={:.2f}s，拦在换槽之前（不改任何值）", remain);
                 return true;
             }
             return false;
@@ -491,8 +494,21 @@ namespace SEMod
     // up 前）持续把 currentShout 钉在第二槽龙吼上，并加日志确认引擎到底读到哪个龙吼。
     void SecondSlotManager::BeginNativeShout()
     {
-        // 新流程开始前，先消化上一轮未还原的 currentShout（避免跨次 X 残留）。
-        TryDeferredRestore();
+        // ⚠️ v1.12 停止-等待（stop-and-wait）：**不允许两个在途事务**。
+        //   旧实现先调 TryDeferredRestore() 就继续，而 TryDeferredRestore 有 300ms 保护窗口会
+        //   直接 return 不做还原 → 此时 currentShout/selectedPower 仍停在借来的第二槽值上，
+        //   紧接着 m_previousShout = high->currentShout 就把**脏值当成原始 Z 槽**记下，
+        //   并覆盖掉上一次尚未归还的真实原值 → Z 槽永久丢失。实测复现：
+        //     [defer-restore] 延迟还原...（21:41:47.493）
+        //     [begin] 原 currentShout=0002F7BA → 换为第二槽=0002F7BA（21:41:47.587，仅隔 94ms）
+        //   修法：上一轮只要还未确认还原，就**拒绝开始新一轮**（等它收尾或由重传机制搞定），
+        //   保证记录原值那一刻槽位一定是干净的。
+        if (m_restorePending) {
+            SKSE::log::warn("AKFS: [begin] 上一轮槽位还原尚未确认（pending，重传次数={}），"
+                            "本次 X 被拒绝以避免把脏值记为原始 Z 槽",
+                            m_restoreRetryCount);
+            return;
+        }
 
         if (!m_secondSlot)
             return;
@@ -508,6 +524,62 @@ namespace SEMod
             return;
         }
         RE::HighProcessData* high = rt.currentProcess->high;
+
+        // ⚠️ v1.10 核心修复「先确认、后换槽」：
+        //   引擎分发按键的真实顺序是 PlayerControls → ShoutHandler::CanProcess(event)（返回 bool，
+        //   冷却检查在这里）→ 返回 true 才调 ShoutHandler::ProcessButton(event, data)。
+        //   旧版插件**直接调 ProcessButton、跳过了 CanProcess**，于是：
+        //     ① 引擎的冷却检查从未执行（这也是"冷却无效"的另一半根因）；
+        //     ② 而换槽（currentShout/selectedPower）发生在调用之前——一旦引擎拒绝，
+        //        换出去的槽没有还原路径 → Z 槽被永久篡改成 X 槽龙吼（用户记忆中的 v0.8 bug）。
+        //   修法：**先**用一个伪造的 Z 键 down 事件问 CanProcess，引擎说不能放就直接返回，
+        //   一个字段都不碰；确认能放之后才换槽、才 ProcessButton。
+        //   ⚠️ CanProcess 是引擎内部函数（CommonLib 无 .cpp 实现），其内部是否只读未经证实，
+        //   故下面用前后快照对比来验证：若它改动了 currentShout/selectedPower 会被 warn 出来。
+        auto* pc = RE::PlayerControls::GetSingleton();
+        if (!pc || !pc->shoutHandler) {
+            SKSE::log::error("AKFS: PlayerControls/shoutHandler 为空，无法注入 Z 键蓄力");
+            return;
+        }
+
+        // 构造"Z 键按下"事件（value=1.0, held=0 → IsDown()），既用于 CanProcess 询问，也用于后续施放。
+        RE::ButtonEvent* downEv = RE::ButtonEvent::Create(
+            RE::INPUT_DEVICE::kKeyboard,
+            RE::UserEvents::GetSingleton()->shout,
+            REX::W32::DIK_Z,   // 默认 Z 键物理码
+            1.0F, 0.0F);
+
+        // 快照：询问前引擎槽位（此时应仍是玩家原始的 Z 槽状态）。
+        auto* shoutBefore = high->currentShout;
+        auto* powerBefore = rt.selectedPower;
+        const bool canProcess = pc->shoutHandler->CanProcess(downEv);
+        auto* shoutAfter = high->currentShout;
+        auto* powerAfter = rt.selectedPower;
+
+        // ⚠️ 验证用：确认 CanProcess 是纯询问（只读）。一旦它动了槽位，立刻暴露出来。
+        if (shoutBefore != shoutAfter || powerBefore != powerAfter) {
+            SKSE::log::warn("AKFS: [canprocess] ⚠️ CanProcess 改动了槽位！"
+                            " currentShout {:08X}→{:08X}，selectedPower {:08X}→{:08X}",
+                            shoutBefore ? shoutBefore->GetFormID() : 0,
+                            shoutAfter ? shoutAfter->GetFormID() : 0,
+                            powerBefore ? powerBefore->GetFormID() : 0,
+                            powerAfter ? powerAfter->GetFormID() : 0);
+            // 它若真改了就原样还回去，避免污染后续流程。
+            high->currentShout = shoutBefore;
+            rt.selectedPower = powerBefore;
+        }
+
+        if (!canProcess) {
+            // 引擎明确表示"现在不能放"（冷却中 / 施放被打断等）→ 直接退出，绝不换槽。
+            // 这样 Z 槽绝不会被篡改，冷却也完全由引擎判定（含属性加成）。
+            SKSE::log::info("AKFS: [canprocess] 引擎拒绝本次 Z 键施放（CanProcess=false），"
+                            "不换槽直接退出；voiceRecoveryTime={:.2f}s voiceState={}",
+                            high->voiceRecoveryTime,
+                            static_cast<std::uint32_t>(high->voiceState.underlying()));
+            return;
+        }
+
+        SKSE::log::info("AKFS: [canprocess] 引擎允许施放（CanProcess=true），开始换槽注入");
 
         // ⚠️ v1.1 首词净化（问题 1 修复）：进游戏首次施放时 high->currentShoutVariation 是脏值
         // （=VariationIDs::kNone 即 -1，见实测日志 4294967295），voiceTimeElapsed 也可能残留，
@@ -541,22 +613,6 @@ namespace SEMod
                         m_previousPower ? m_previousPower->GetFormID() : 0,
                         shout->GetFormID());
 
-        auto* pc = RE::PlayerControls::GetSingleton();
-        if (!pc || !pc->shoutHandler) {
-            high->currentShout = m_previousShout;
-            m_previousShout = nullptr;
-            rt.selectedPower = m_previousPower;
-            m_previousPower = nullptr;
-            SKSE::log::error("AKFS: PlayerControls/shoutHandler 为空，无法注入 Z 键蓄力");
-            return;
-        }
-
-        // 喂 Z 键 down（value=1.0, held=0 → IsDown()），触发引擎 ShoutHandler 开始蓄力。
-        RE::ButtonEvent* downEv = RE::ButtonEvent::Create(
-            RE::INPUT_DEVICE::kKeyboard,
-            RE::UserEvents::GetSingleton()->shout,
-            REX::W32::DIK_Z,   // 默认 Z 键物理码
-            1.0F, 0.0F);
         m_shoutActive = true;
         m_shoutStart = std::chrono::steady_clock::now();
         pc->shoutHandler->ProcessButton(downEv, &pc->data);
@@ -689,6 +745,10 @@ namespace SEMod
             }
         }
 
+        // ⚠️ v1.9：此处**不再对冷却做任何处理**（旧版曾在此打 m_shoutCdEngaged 标记）。
+        //   冷却值由引擎在 up 结算时自己写好并自己递减，插件不记录、不干预——
+        //   避免"标记永不解除"一类状态卡死，也避免与 HUD 冷却条抢同一个字段。
+
         // ⚠️ currentShout 需延迟还原（异步早阶结算要读取，见下）。
         // selectedPower 同理：日志实锤（2026-10-13 SEMod.log）——引擎**异步施放(1/2 阶)的声音来源
         // 是 selectedPower(0x1E0) 而非 currentShout**：
@@ -713,6 +773,9 @@ namespace SEMod
         // 用 m_restoreAt 记硬上限时刻（now+kMaxShoutRestoreWait），TryDeferredRestore 结合它判定。
         m_restorePending = true;
         m_restoreAt = std::chrono::steady_clock::now() + kMaxShoutRestoreWait;
+        // v1.12：新事务开始 → 重置重传计数与未确认标志（上一次的成功/失败不应影响本次）。
+        m_restoreRetryCount = 0;
+        m_restoreUnacked = false;
         SKSE::log::info("AKFS: [defer-restore] 延迟还原 currentShout+selectedPower（等 voiceState 归零，最晚 {}ms）",
                         kMaxShoutRestoreWait.count());
 
@@ -739,6 +802,14 @@ namespace SEMod
         const auto now = std::chrono::steady_clock::now();
         if (now < m_restoreAt - kMaxShoutRestoreWait + kShoutRestoreMinHold)
             return;
+
+        // ⚠️ v1.12 重传分支：上一次还原已写出但回读校验失败 → 立刻重发，**不再走"钉回第二槽"**。
+        //   如果这里还去钉第二槽，就会和还原目标互相打架（一个往回写原值、一个写第二槽）。
+        if (m_restoreUnacked) {
+            SKSE::log::info("AKFS: [restore] 执行第 {} 次重传", m_restoreRetryCount + 1);
+            RestoreCurrentShout();   // 内部会再次写入+校验，未过则继续标记 unacked
+            return;
+        }
 
         // 2) pending 期间每帧把 currentShout 与 selectedPower 重钉回第二槽，防止引擎异步结算步骤
         //    把两者换回玩家选中槽（若换回，异步施放/声音就读到 Z 槽）。
@@ -802,6 +873,16 @@ namespace SEMod
         if (m_restorePending) {
             RestoreCurrentShout();   // 立即归位 currentShout/selectedPower，清 pending
             SKSE::log::info("AKFS: [power] 施放能力前清掉残留的龙吼延迟还原，已归位 currentShout/selectedPower");
+            // v1.12：能力施放不参与龙吼的重传事务，这里强制清空重传状态，避免影响下一次龙吼施放。
+            if (m_restorePending) {   // 若仍未确认（引擎干扰），放弃该事务，保证能力施放不被拖住
+                SKSE::log::warn("AKFS: [power] 龙吼还原仍未确认，放弃该还原事务（重传次数={}）",
+                                m_restoreRetryCount);
+                m_restorePending = false;
+                m_restoreUnacked = false;
+                m_restoreRetryCount = 0;
+                m_previousShout = nullptr;
+                m_previousPower = nullptr;
+            }
         }
         auto* player = Player();
         if (!player)
@@ -858,22 +939,56 @@ namespace SEMod
         if (!player)
             return;
         auto& rt = player->GetActorRuntimeData();
-        // ⚠️ v1.2 修复"Z 变 X 槽龙吼"：selectedPower 须**无条件**还原为换槽前的值 m_previousPower
-        //（可为 null）。原 `if(m_previousPower)` 在 m_previousPower 为 null（如设槽后第一次施放、
-        //  引擎 selectedPower 本为空时）会跳过还原 → selectedPower 残留第二槽龙吼 → 魔法菜单 Z 选中
-        //  变成 X 槽龙吼。m_previousPower 在换槽时记录、此处还原、用后置 null，更换严格配对，写 null
-        //  不误清玩家选择（v0.15 担心的"写 null 清玩家 Z 选"是 m_previousPower 被提前清零的另一场景，
-        //  与本条件无 guarantee 冲突——此处还原的就是玩家原来的值）。日志辅助定位还原前后值。
+
+        // ⚠️ v1.12 停止-等待协议：此处是要"发送"的还原事务。发出后**必须回读校验**，
+        //   因为引擎会在施放过程中反复改写这两个字段（日志中"被引擎换回"的 warn 即是证据）。
+        //   校验不过则置 m_restoreUnacked=true，由 TryDeferredRestore 每帧重发，最多 kRestoreMaxRetries 次。
+        //   注意：**不清空 m_previousShout/m_previousPower**，因为重发时还要用它们；只有在
+        //   校验通过（或重试耗尽）后才清理——这修复了旧版"发出即丢弃原值、无法重发"的缺陷。
         SKSE::log::info("AKFS: [restore] selectedPower 还原前 当前={:08X} m_previousPower={:08X}",
                         rt.selectedPower ? rt.selectedPower->GetFormID() : 0,
                         m_previousPower ? m_previousPower->GetFormID() : 0);
+
+        // —— 发送：写回原值 ——
         rt.selectedPower = m_previousPower;   // 无条件还原（可为 null）
-        m_previousPower = nullptr;
-        // currentShout：currentShout 与 selectedPower 分开暂存，各自独立还原。
         if (rt.currentProcess && rt.currentProcess->high)
             rt.currentProcess->high->currentShout = m_previousShout;
+
+        // —— 校验：回读确认真的回到了原值 ——
+        auto* highNow = (rt.currentProcess ? rt.currentProcess->high : nullptr);
+        const bool shoutOk = !highNow || highNow->currentShout == m_previousShout;
+        const bool powerOk = rt.selectedPower == m_previousPower;
+
+        if (!shoutOk || !powerOk) {
+            // 未确认：保留原值以便重发，标记 unacked。
+            m_restoreUnacked = true;
+            m_restorePending = true;   // 保持 pending，交给 TryDeferredRestore 重发
+            ++m_restoreRetryCount;
+            if (m_restoreRetryCount > kRestoreMaxRetries) {
+                SKSE::log::warn("AKFS: [restore] ⛔ 重传 {} 次仍未确认（shoutOk={} powerOk={}），放弃本次还原以避免死循环；"
+                                " 目标 currentShout={:08X} selectedPower={:08X}",
+                                m_restoreRetryCount - 1, shoutOk ? 1 : 0, powerOk ? 1 : 0,
+                                m_previousShout ? m_previousShout->GetFormID() : 0,
+                                m_previousPower ? m_previousPower->GetFormID() : 0);
+                m_restoreUnacked = false;
+                m_restorePending = false;
+                m_previousShout = nullptr;
+                m_previousPower = nullptr;
+                return;
+            }
+            SKSE::log::warn("AKFS: [restore] 回读校验未通过（shoutOk={} powerOk={}），第 {} 次重传将于下一帧进行",
+                            shoutOk ? 1 : 0, powerOk ? 1 : 0, m_restoreRetryCount);
+            return;
+        }
+
+        // —— 确认通过：清理事务状态 ——
+        if (m_restoreRetryCount > 0)
+            SKSE::log::info("AKFS: [restore] 重传 {} 次后确认成功", m_restoreRetryCount);
         m_previousShout = nullptr;
+        m_previousPower = nullptr;
         m_restorePending = false;
+        m_restoreUnacked = false;
+        m_restoreRetryCount = 0;
     }
 
     // ==================== v1.7 菜单状态展示用的只读访问器 ====================
@@ -891,13 +1006,11 @@ namespace SEMod
         auto* player = self->Player();
         if (!player)
             return 0.0F;
-        // 与 OnCooldown 保持一致：插件空闲时的残留 voice 冷却视为垃圾，对用户显示"就绪"。
+        // ⚠️ v1.9：直接反映引擎的真实值——这正是 HUD 冷却条读的同一个字段，
+        //   故菜单显示与游戏内冷却条天然一致。插件不再用"忙闲/标记"过滤，
+        //   避免出现"菜单说就绪、游戏里还在冷却"的分歧。
         const float remain = player->GetVoiceRecoveryTime();
-        if (remain <= 0.0F)
-            return 0.0F;
-        if (!m_shoutActive && !m_restorePending)
-            return 0.0F;  // 空闲时的残留值不算真冷却
-        return remain;
+        return remain > 0.0F ? remain : 0.0F;
     }
 
     float SecondSlotManager::GetPowerCooldownRemaining(const std::uint32_t a_formId) const

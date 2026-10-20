@@ -70,7 +70,7 @@ E:\SE mod\
 
 | 文件/模块 | 职责 |
 |-----------|------|
-| `src/SecondSlotManager.{h,cpp}` | X 键第二槽管理器(Service)。持有第二槽 `TESForm*`；继承 `BSTEventSink<InputEvent*>` 挂 `BSInputDeviceManager`：X 键按下瞬间按**物理扫描码** `GetIDCode()==DIK_X` 判定(不靠 QUserEvent，曾因空命令名失效)，按 `UI::IsMenuOpen(MagicMenu)` 分化——菜单开=`StoreHighlightedToSlot()`(经 `MenuMouseIntercept` 读高亮项并判定 Z 键类后存槽)，菜单关=`CastSecondSlot()`(**经 `GetMagicCaster(kInstant)->CastSpellImmediate` 立即施放**)。**已实测可用**。v1.7 增只读访问器(`GetSecondSlotForm`/`GetSecondSlotIsShout`/`GetShoutCooldownRemaining`/`GetPowerCooldownRemaining`/`GetVoiceState`/`GetCurrentZShout`/`IsShoutCharging`/`IsRestorePending`)与 `TestCastSecondSlot()` 供菜单状态页使用，均为纯读、不影响施放逻辑。 |
+| `src/SecondSlotManager.{h,cpp}` | X 键第二槽管理器(Service)。持有第二槽 `TESForm*`；继承 `BSTEventSink<InputEvent*>` 挂 `BSInputDeviceManager`：X 键按下瞬间按**物理扫描码** `GetIDCode()==DIK_X` 判定(不靠 QUserEvent，曾因空命令名失效)，按 `UI::IsMenuOpen(MagicMenu)` 分化——菜单开=`StoreHighlightedToSlot()`(经 `MenuMouseIntercept` 读高亮项并判定 Z 键类后存槽)，菜单关=`CastSecondSlot()`(**经 `GetMagicCaster(kInstant)->CastSpellImmediate` 立即施放**)。**已实测可用**。v1.7 增只读访问器(`GetSecondSlotForm`/`GetSecondSlotIsShout`/`GetShoutCooldownRemaining`/`GetPowerCooldownRemaining`/`GetVoiceState`/`GetCurrentZShout`/`IsShoutCharging`/`IsRestorePending`)与 `TestCastSecondSlot()` 供菜单状态页使用，均为纯读、不影响施放逻辑。**v1.12（1.1.1）三处关键变更**：① `OnCooldown()` 龙吼分支简化为**只拦不清**——`voiceRecoveryTime > 0` 即拦截，**不写任何引擎字段**（删除 v1.5 的"假冷却自愈"清零逻辑，该逻辑在冷却全程误删真冷却；也避免了与 HUD 冷却条 `bVoiceReady` 争抢同一字段）；② 冷却拦截位于**换槽之前**，避免引擎拒绝时 `currentShout`/`selectedPower` 已换出却无还原路径 → Z 槽被篡改；③ `RestoreCurrentShout()` 改为**停止-等待 + 写后校验 + 有限重传**（`kRestoreMaxRetries=8`，未确认则保留 `m_previousShout/m_previousPower` 供重发），`BeginNativeShout()` 在 `m_restorePending` 时**拒绝**新施放，杜绝"把借来的槽值记为原始 Z 槽"。此外 `BeginNativeShout()` 保留 `ShoutHandler::CanProcess()` 预检（实测其**不做冷却检查**，仅作防御层）。 |
 | `src/MenuMouseIntercept.{h,cpp}` | 魔法菜单纯查询工具(无 hook)：`IsZCastForm`(Shout 恒真；Spell 的 kPower/kLesserPower/kVoicePower)、`GetShoutFromForm`/`GetSpellFromForm`(解析可施放 spell)、`ResolveHighlightedForm`(读当前高亮项 formID→TESForm。实测路径: `Menu_mc.inventoryLists.panelContainer.itemList` → `itemList.selectedIndex` → `entryList[选中]` → **entry.formId**(小写d/number，无 data 层) → `LookupByID`)。供 SecondSlotManager 使用。**已实测可用** |
 | `src/AKFSMenu.{h,cpp}` | **v1.7 新增** SKSE Menu Framework 前端（纯 C++，无 Papyrus/ESP/SkyUI）。`AKFSMenu::Register()` 在 `SKSEPlugin_Load` 调用，内部先 `IsInstalled()` 判定前置插件是否存在，未装则直接返回（**可选依赖**，X 键主功能不受影响）。两个 SectionItem：`PageSettings`(触发键/能力每日一次/DailyBypass/BlockedPowers/语言)、`PageStatus`(第二槽/Z 槽/冷却/voiceState + 清空/重载/测试施放)。改配置经 `AKFSConfig::Set*` **内存+ini 双写**。物理键捕获经 `AddInputEvent`，动作投递经 `AddHudElement` 下帧消费。**已编译通过** |
 | `src/main.cpp` | 插件入口；`SKSEPlugin_Load` 做 `SKSE::Init` + `AKFSConfig::Load()` + `AKFSMenu::Register()` + 消息监听；`kDataLoaded` 注册 `SecondSlotManager`。**已编译通过** |
@@ -113,9 +113,24 @@ E:\SE mod\
 
 ## 5. 运行期文件位置 (部署)
 
-- 插件 DLL → `E:\SE mod\build\out\Release\SEMod.dll` → 部署到游戏 `Data\SKSE\Plugins\SEMod.dll`
-- 日志 → `%USERPROFILE%\Documents\My Games\Skyrim Special Edition\SKSE\SEMod.log`（本插件由 `SKSE::log` 生成）
-- 需求插件：SKSE64、Address Library(适配 1.6.1170 的数据)
+- 插件 DLL → `E:\SE mod\build\out\Release\AKFS.dll` → 部署到游戏 `Data\SKSE\Plugins\AKFS.dll`（文件名须为 `AKFS.dll`，插件自身据此定位 ini 所在目录）
+- 配置 ini → 游戏 `Data\SKSE\Plugins\AKFS.ini`（**必须与 DLL 成对更新**；含 `[Strings]` 节，旧 ini 会导致菜单显示键名）
+- 部署副本 → `E:\SE mod\AKFS_latest_for_game.dll`（每次构建后复制）
+- 日志 → `%USERPROFILE%\Documents\My Games\Skyrim Special Edition\SKSE\Another Key for Shout.log`
+- 需求插件：SKSE64、Address Library(适配 1.6.1170 的数据)；SKSE Menu Framework 为**可选**（仅配置菜单需要）
+
+---
+
+## 5.1 发布产物 (1.1.1 起)
+
+| 产物 | 位置 | 结构 |
+|------|------|------|
+| `Another Key for Shout 1.1.1.zip` | `dist\` 与 `archive\AKFS\releases\` | `SKSE\Plugins\{AKFS.dll, AKFS.ini(英文)}`，无 FOMOD |
+| `Another Key for Shout 1.1.1_CHS.zip` | 同上 | 同上，ini 为中文 |
+| `AKFS_source_1.1.1.zip` | 同上 | `src\` + `docs\` + `plugin\` + 根文件（27 项） |
+| 打包脚本 | `Tool/pack_1.1.1.ps1` | `powershell -NoProfile -ExecutionPolicy Bypass -File` 运行 |
+
+> ⚠️ 本机 PowerShell 执行策略禁止直接运行 .ps1，必须带 `-ExecutionPolicy Bypass`。脚本内的中文文件名用"按扩展名枚举"取得，避免 PowerShell 5.1 按 GBK 解析 UTF-8 脚本导致的乱码/语法错误。
 
 ---
 

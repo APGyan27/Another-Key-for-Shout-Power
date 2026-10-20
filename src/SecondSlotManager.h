@@ -179,6 +179,21 @@ namespace SEMod
         std::chrono::steady_clock::time_point m_restoreAt{};   // 延迟还原到点时刻
         // v1.1：能力独立冷却——按各能力 formID 记最近施放时刻（能力间不共享冷却）。
         std::unordered_map<std::uint32_t, std::chrono::steady_clock::time_point> m_powerCdUntil;
+        // ============ v1.12 槽位还原的可靠传输协议（停止-等待 + 写后校验 + 有限重传）============
+        // 背景：还原 currentShout/selectedPower 本质是一次**不可靠写入**——引擎会在施放过程中
+        // 反复改写这两个字段，且写入后可能立刻被改回（日志中"被引擎换回"的 warn 即是证据）。
+        // 旧实现是"发出即认为成功"，导致两类无法恢复的故障：
+        //   ① 上一次还没还原就又开始新一轮 → m_previousShout 记录到的是借来的 X 槽值（脏原值）；
+        //   ② 同一个 m_previousShout 被新一轮直接覆盖 → 真正的原值永久丢失。
+        //   实测可在"快速连按 X、间隔 < 300ms（保护期）"时复现，极难手动命中。
+        // 对策（借用 ARQ/停止-等待思想）：
+        //   · 停止-等待：一旦 m_restorePending 为真，**禁止**开始新一轮换槽（不允许两个在途事务）；
+        //   · 写后校验：还原后立即回读，确认字段真的回到原值，否则记录未确认；
+        //   · 有限重传：未确认则每帧重发，超过上限则告警放弃（不无限占用）；
+        //   · 超时降级：3s 硬上限沿用，超时强制写一次并告警。
+        std::uint32_t  m_restoreRetryCount{ 0 };      // 当前还原事务已重传次数
+        bool           m_restoreUnacked{ false };     // 已写出但回读校验未通过（需重发）
+        std::uint32_t  m_castSeq{ 0 };                // 施放序号（诊断用，便于日志串起来）
         // v1.3：能力"一天一次"——按各能力 formID 记最近施放时的**游戏日**(Calendar::GetDaysPassed 取整)。
         std::unordered_map<std::uint32_t, float> m_powerUsedDay;
         bool           m_storePendingRelease{ false };         // v0.20 本次 X 是在菜单里用于存槽——抬起时不施放（防"退出菜单即释放"）

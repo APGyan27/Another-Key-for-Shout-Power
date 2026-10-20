@@ -140,6 +140,10 @@
 | 2026-v1.4 | **只对 kPower 套"当日一次"，可反复能力/例外组合开后门**（UESP 明文依据：Greater Powers=每天一次、Lesser Powers=可任意次；Beast Form+净化 Ring of Hircine 为"类型 kPower 却可反复"的例外）。原 v1.3 对**所有**能力套当日门禁 → 误杀可反复用的 kLesserPower(如吸血鬼领主变身/Night Eye/黑市等)。**修复**：新增 `IsDailyPower(const RE::SpellItem*)`= `${SpellType==kPower} && !DailyBypassContains(formID)`；`OnCooldown` 能力分支仅当 `IsDailyPower(槽内spell)` 才查 `PowerUsedToday`，`CastPowerNow` 也仅对 IsDailyPower 落库"当日一次"。**后门**：ini `[Settings] DailyBypass=<formID1>,<formID2>,…`(8位hex, 逗号/空白分隔, AKFSConfig 增 `s_dailyBypass unordered_set` + `DailyBypassContains`)。kLesserPower(3)/kVoicePower(11) 恒只走 3s 短冷却。⚠️ 编译坑：`IsDailyPower` 形参用 `const RE::SpellItem*` 需头文件前向声明 `class SpellItem;`（原仅有 PlayerCharacter/TESForm/TESShout），否则 C2039 SpellItem 非 RE 成员。src=613888B | ✅ 完成(编译通过, 待实测) |
 | 2026-v1.7 | **SKSE Menu Framework 配置菜单（弃用 MCM 方案）**。用户先问"不用 Papyrus 能否用 MCM"，结论：**SkyUI MCM 在架构上必须挂 `SKI_ConfigBase` 的 Papyrus Quest，纯 C++ 插件接不进**（MCM 扫描的就是挂该脚本的 Quest 实例，没有魔改工作区之外的注册入口）。用户遂改选 **SKSE Menu Framework**（独立 SKSE 插件 + 纯头文件 C++ API，**无 Papyrus / 无 ESP / 无 SkyUI**），前置依赖用户已接受。**集成机制**：`SKSEMenuFramework.h`(520KB 单头) 用 `GetModuleHandleW(L"SKSEMenuFramework")` + `GetProcAddress` 运行期解析，**不链接任何库、不需 vcpkg**，CMake 只需 `target_include_directories`；`SKSEMenuFramework::IsInstalled()` 检查 `Data/SKSE/Plugins/SKSEMenuFramework.dll` 是否存在 → **可选依赖，未装则 `Register()` 直接 return，X 键主功能不受影响**。**配置架构（C 方案，用户拍板）**：业务代码只读内存静态变量（`AKFSConfig::KeyCode()` 不看 ini），故**必须改内存才立即生效**；ini 仅作"下次启动恢复"。故新增的 `Set*` 全部**内存+ini 双写**：先改内存（SecondSlotManager 零改动即生效）再 `WritePrivateProfileStringA` 落盘。**本地化（用户定稿 A 方案）**：两个完整语言 ini（`Language/Chinese/`、`Language/English/`）各含 `[Settings]`+`[Lang]`+**新增 `[Strings]` 节**，安装时由现有 FOMOD 择一拷成 `AKFS.ini` —— 因"提示文案在菜单里改不了"，故文案必须随安装语言走。`AKFSConfig::Text(key)` 查 `[Strings]`，查不到回退返回 key 本身（便于定位漏翻）。⚠️ Win32 无枚举 ini 节内键的 API，故用 `kStringKeys[]` 已知键清单逐个 `GetPrivateProfileStringA`。字体问题**用户明确甩给用户自己解决**（属 SKSE Menu Framework 自身配置，插件不管）。**新增文件** `src/AKFSMenu.{h,cpp}`；**接口扩展**：`AKFSConfig` 增 `Reload()`/`SetKeyCode`/`SetPowerOncePerDay`/`SetLanguage`/`SetDailyBypass`/`SetBlockedPowers`/`DailyBypassSet`/`BlockedPowersSet`/`Text`/`IniPath`/`ReloadStringsFrom`；`SecondSlotManager` 增 8 个纯读访问器 + `TestCastSecondSlot()`。**菜单两页**：`设置`(触发键滑块+物理键 Capture 绑定/能力每日一次/DailyBypass 与 BlockedPowers 列表增删/界面语言 Combo/重载 ini)、`状态`(第二槽 formID+名称+类型/Z 槽龙吼/龙吼与能力冷却实时倒计时/voiceState/charging/restorePending/ini 路径 + 清空槽/重载/测试施放按钮)—— **状态与动作是 ini 永远给不了的**，尤其 `voiceState`/`m_shoutActive`/`m_restorePending` 可直接观察 MEMORY 里反复踩的"卡蓄力/还原残留"类 bug。**动作投递**：按钮只置 `g_pendingXxx` 标志，由 `AddHudElement` 的每帧回调消费，**不在 ImGui 渲染回调里直接驱动游戏施放**。src=649216B | ✅ 完成(编译通过，导出 SKSEPlugin_Load/Query/Version 已验证，待实测) |
 
+| 2026-v1.11 | **冷却改"只拦不清"（删除"假冷却自愈"）**。用户报"X 键龙吼无冷却，但有冷却提示"。**日志实锤**：18:24:32 `[up] 施放后 voiceRecoveryTime=35.65s`（引擎确实写入）→ 18:25:12 `[begin] 前快照 voiceRecoveryTime=0.00s`（自然递减归零）。**根因**：v1.5 的"残留自愈"判据是 `remain>0 && !m_shoutActive && !m_restorePending`（插件空闲），而**插件空闲恰好就是冷却正常进行的整个时段**（施放已结束、槽已还原）→ 每段真冷却开场即被清零放行。v1.5 当时的前提"引擎从不写该字段（实测恒 0.00s）"是**错误观察**，引擎确实会写且会自动递减。**修复**：删除 `kShoutCdStuckLimit`、清零、标记与超时保险，`OnCooldown()` 龙吼分支只剩 `if (remain > 0) return true;`（**只读、一个字段都不写**）。冷却时长由引擎按 `variations[阶].recoveryTime` 算，属性加成正常生效，也不再与 HUD 冷却条（Flash 变量 `bVoiceReady`，见 `RE/F/FixedStrings.h:119`）争抢同一字段 | ✅ 完成(编译通过) |
+| 2026-v1.10 | **先确认后换槽（CanProcess 预检）+ 排除 CanProcess 嫌疑**。用户记起 v0.8 时代"用原版冷却监听会导致 Z 键龙吼被篡改成 X 的"。**实现**：`BeginNativeShout()` 里构造 Z 键 down 事件后，**先**调 `pc->shoutHandler->CanProcess(downEv)` 询问引擎，返回 false 则不换槽直接退出；并对问前/问后分别快照 `currentShout`/`selectedPower`，若被改动则 warn + 还原（用于验证 CanProcess 是否只读）。**实测结论（关键）**：`[canprocess]` 共 8 次**全部返回 true**，含 `voiceRecoveryTime=16.19s / 33.92s / 27.25s` 的冷却中情形，且**无一条**"CanProcess 改动了槽位" warn → **① CanProcess 不做冷却检查；② CanProcess 是纯询问（只读），无修改副作用**。故"用 CanProcess 挡冷却"这条路**不通**，冷却必须在换槽前由插件自拦 | ✅ 完成(已实测证伪其可行性) |
+| 2026-v1.12 | **槽位还原引入可靠传输协议（停止-等待 + 写后校验 + 有限重传），修复隐蔽 Z 槽丢失**。用户报"非常隐蔽的 Z 键龙吼篡改，难以复现"。**日志实锤**（21:41:47）：`.493 [defer-restore] 延迟还原...` → `.587 [begin] 原 currentShout=0002F7BA → 换为第二槽=0002F7BA`（仅隔 **94ms**）→ 把**借来的第二槽值**记成了原始 Z 槽，且覆盖了上一次未归还的真值 → **永久丢失**。**根因**：`TryDeferredRestore()` 有 300ms 保护窗口（为让引擎异步结算读完 currentShout），窗口内直接 return 不还原；快速连按时 `m_previousShout = high->currentShout` 就记录到脏值。**修法**：① **停止-等待**——`m_restorePending` 为真时**拒绝**开始新一轮施放（不允许两个在途事务），从根上保证"记录原值时槽位一定干净"；② **写后校验**——还原写入后立即回读，确认字段真回到原值，否则置 `m_restoreUnacked`；③ **有限重传**——未确认则下一帧重发，最多 `kRestoreMaxRetries=8` 次，超过则 warn 放弃；④ **超时降级**——沿用 3s 硬上限。**要点**：`RestoreCurrentShout()` 校验失败时**不清空** `m_previousShout/m_previousPower`（重发还要用），只有确认通过或重试耗尽才清。**实测验证**：修复后同样 88ms 间隔的连按被正确拒绝（`[begin] 上一轮槽位还原尚未确认（pending），本次 X 被拒绝以避免把脏值记为原始 Z 槽`），Z 槽保持完好；`重传 N 次后确认成功`/`回读校验未通过` 均未出现（说明该日志期内引擎未干扰还原写入，重传作为备用保险未启用） | ✅ 完成(编译通过, 日志验证停止-等待生效) |
+
 
 - ❌ 否决项：无(项目起步，尚未有否决记录)。
 
@@ -180,6 +184,20 @@
 - **`RE::GFxValue::Invoke(name, result, args, n)` 是非 const 方法**：用 `const GFxValue&` 传列表参数再 `Invoke("GetLength")` 会报 C2663(this 丢失限定符)。要调 Invoke 的辅助函数其参数必须是 **非 const `GFxValue&`**(`GetMember` 是 const 可放宽，`Invoke`/`CreateEmptyMovieClip` 不是)。
 - **访问 `rt.currentProcess->GetCurrentShout()` 需显式 include `RE/A/AIProcess.h`**：只 include `RE/P/PlayerCharacter.h` 会带出 Actor.h 的 `AIProcess*` 字段声明但 **未定义** `RE::AIProcess` 类型 → 报 C2027 未定义类型。而 `AIProcess::GetCurrentShout()` 返回 `TESShout*`(非 const 方法，`GetActorRuntimeData()` 的引用也必须是 `const auto&` 仍可调，因指针 pointee 非 const)。
 - **dumpbin 具体路径**：`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\dumpbin.exe`(在 14.51 工具集的 Hostx64\x64 子目录，不在 `...\bin\` 根)。
+- **⚠️ 判断"读来的字段是真值还是垃圾"前，必须先证明该字段的独占性**（2026-10-20 血泪）：
+  `voiceRecoveryTime` 被 **HUD 冷却条（Flash 变量 `bVoiceReady`）与引擎施放拦截共用**，且由引擎自己写入/递减。
+  v1.5 基于"引擎从不写（恒 0.00s）"这个**错误观察**，推出"插件空闲时非零=垃圾"，于是每段真冷却开场就被清零
+  → 表现为"无冷却但有冷却提示"。**教训：宁可用"只读判断+拦截"，绝不"猜测+清零"；清零一个共享字段会同时破坏
+  显示与判定两个系统。** 另：一旦某个"补丁"的前提假设被后续日志推翻，必须整体回退该补丁，而不是在它上面继续打补丁。
+- **⚠️ 引擎拒绝施放时不会有"回滚"**：`BeginNativeShout()` 先换 `currentShout`/`selectedPower` 再喂 Z 键事件；
+  引擎若拒绝，换出的槽**没有任何还原路径** → 永久污染 Z 槽。故**任何可能被拒绝的前置检查都必须放在换槽之前**。
+  实测 `ShoutHandler::CanProcess()` **不做冷却检查**（8/8 返回 true，含冷却 16~34s 情形），不能拿它挡冷却。
+- **⚠️ 涉及"借-还"状态的事务要用停止-等待**：`m_previousShout`(记录原值) 与 `m_restorePending`(待归还) 是成对的。
+  只要上一轮未确认归还就允许开始新一轮，"记录原值"就会记录到假的原值、并覆盖真正待归还的值 → 丢失不可恢复。
+  修法：`m_restorePending` 为真时拒绝新事务 + 写后回读校验 + 有限重传（详见 §3 2026-v1.12）。
+- **⚠️ 本机 PowerShell 执行策略禁止直接运行 .ps1**：需 `powershell -NoProfile -ExecutionPolicy Bypass -File <脚本>`。
+  另：**含中文的 .ps1 必须注意编码**——PowerShell 5.1 会按 GBK 解析 UTF-8 脚本，中文注释/字符串会变乱码并引发语法错误
+  （实测报 `Missing ')' in function parameter list`）。规避：脚本内避免中文，或用"按扩展名枚举"取中文文件名。
 
 ---
 
@@ -226,6 +244,9 @@
 - [x] **v0.17 修复版用户实测（2026-10-13）**：红字已解决 ✅（voiceState 归零才还原 currentShout 生效）；但 **1/2 阶声音仍错**——1 阶=Z 槽 1 阶声；2 阶=X 槽蓄力声后接 Z 槽 2 阶声；3 阶正确。`currentShout` 全程钉在第二槽(00013E07)却**仍听到 Z 声** → 证明 **异步施放(1/2 阶)的声音来源是 `selectedPower`(0x1E0) 而非 currentShout**（v0.15/v0.17 已把 selectedPower"立即还原"回 Z 槽 00070980）。
 - [x] **v0.18 修复版实测（2026-10-13）**：**龙吼全阶正确 ✅**（声音全程第二槽，红字不回归）。
 - [x] **v0.19 特殊能力修复版已交付**（能力独立冷却 + 施放能力前清残留；编译导出通过，待用户实测）。
+- [x] **v1.12 / 发布 1.1.1 已交付并打包（2026-10-20）**：修复三项冷却与槽位还原问题（详见 §3 决策日志 2026-v1.10 / v1.11 / v1.12）。`AKFS.dll` 653824B，导出 `SKSEPlugin_Load/Query/Version` 已验证。**发布包**（结构 `SKSE\Plugins\{AKFS.dll,AKFS.ini}`）：`Another Key for Shout 1.1.1.zip`(英文默认,281393B)、`Another Key for Shout 1.1.1_CHS.zip`(中文,281643B)；**源码包** `AKFS_source_1.1.1.zip`(394424B，27 项，结构与 1.1.0 完全一致)。产物同时在 `E:\SE mod\dist\` 与 `archive\AKFS\releases\`。打包脚本：`Tool/pack_1.1.1.ps1`（需 `powershell -ExecutionPolicy Bypass -File` 运行，因本机执行策略限制；脚本内中文注意用文件枚举规避编码问题）。
+  > **实测已验证**：① 龙吼冷却恢复正常（不再被清零）；② 冷却中按 X 被拦在换槽之前，Z 槽不再被篡改；③ 88ms 快速连按触发的"停止-等待"正确拒绝，日志 `[begin] 上一轮槽位还原尚未确认（pending），本次 X 被拒绝…`，Z 槽保持完好。
+  > **遗留观察点**：若后续日志中出现 `回读校验未通过` 或 `重传 N 次后确认成功`，说明引擎开始干扰还原写入（当前版本一次都没触发）；若 `本次 X 被拒绝` 过于频繁影响手感，可考虑调短 `kShoutRestoreMinHold`（当前 300ms）。
 - [ ] **v1.4 只对 kPower 套"当日一次" + DailyBypass 后门待用户实测**（`E:\SE mod\AKFS_latest_for_game.dll`(613888B,2026/10/14 16:36) 覆盖游戏 Plugins\AKFS.dll，**重开游戏**）：
   > **现状**：仅 `SpellType==kPower` 且不在 `[Settings] DailyBypass` 后门清单的能力才套当日门禁；kLesserPower/kVoicePower 只走 3s 短冷却。
   > **UESP 依据**（Skyrim:Powers 页，来源 URL 见 §3 v1.4）：Greater Powers(大能力,=kPower) 每天一次；Lesser Powers(=kLesserPower) 可任意次；Beast Form+净化 Ring of Hircine 是"kPower 但可反复"的异常 → DailyBypass 后门覆盖。

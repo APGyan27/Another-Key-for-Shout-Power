@@ -186,3 +186,55 @@
   selectedPower，避免把玩家既有 Z 选槽清成 null）。约定：**换槽暂存方法**——`BeginNativeShout` 里先存
   `m_previousShout=currentShout`、`m_previousPower=selectedPower` 再换，还原时依此回位。
 - **字段/上述判定依据（SEMod.log 2026-10-13）**：3 阶 up 后 `voiceState=5(kPostcast) variation=2(kThree)`；1 阶 up 后 `voiceState=2(kStart)/3(kContinue) variation=0(kOne)`；空闲 voiceState=0(kNone)。`voiceState` 值域：kNone=0,kRequest=1,kStart=2,kContinue=3,kPrecast=4,kPostcast=5,kFail=6。
+
+## 四之十、v1.10~v1.12 — 冷却机制最终定论与"先确认后换槽" (2026-10-20)
+
+> 背景：用户报"X 键龙吼无冷却（但有冷却提示）"，随后又发现"冷却中按 X 会篡改 Z 键龙吼"，且该篡改在快速连按（<300ms）时**永久丢失** Z 槽。
+
+### A) `ShoutHandler::CanProcess()` 的真实行为（**已实测，重要**）
+
+- 引擎分发按键的真实顺序为 `PlayerControls → ShoutHandler::CanProcess(event)`（**返回 bool**）→ 返回 true 才调 `ProcessButton(event, data)`。**`CanProcess` 才是"确认机制"**，`ProcessButton` 是 void 无返回。
+- 旧版插件**直接调 `ProcessButton`，长期跳过 `CanProcess`**。
+- **实测结论（2026-10-20 日志，8 次调用）**：`CanProcess` 在 `voiceRecoveryTime=16.19s / 33.92s / 27.25s`（明显冷却中）时**仍全部返回 true**，
+  且问前/问后快照对比显示**它没有改动** `currentShout`/`selectedPower`。→ **① `CanProcess` 不做冷却检查（不能用它挡冷却）；② 它是纯询问（只读），无修改副作用。**
+- 声明位置：`RE/S/ShoutHandler.h:15`（`CanProcess`）/ `:16`（`ProcessButton`）；vtable `RE/Offsets_VTABLE.h:2363`（`VTABLE_ShoutHandler`，aeID=208735）。
+
+### B) 冷却值 `voiceRecoveryTime` 的真相（推翻 v1.5 的"假冷却"理论）
+
+- **引擎确实会写该字段**：日志 18:24:32 `[up] 施放后 voiceRecoveryTime=35.65s`（在本阶级结算时写入）。
+- **引擎确实会自动递减**：18:25:12 同样位置的快照已是 `0.00s`（40 秒后自然归零）。
+- **它是 HUD 与拦截的共用字段**：HUD 冷却条经 Flash 变量 `bVoiceReady`（见 `RE/F/FixedStrings.h:119`）读它显示；`ProcessButton` 内部按它拒绝施放。
+  → 插件一旦清零，**显示与拦截会同时错乱**，这正是"有冷却条却能放出来"的成因。
+- **"假冷却/垃圾残留"是 v1.5 基于错误观察（"引擎从不写，恒 0.00s"）发明的概念**，实际不存在。
+  v1.5 的判据 `remain>0 && !m_shoutActive && !m_restorePending`（插件空闲）**恰好命中冷却正常进行的全部时段** → 100% 误删。
+
+### C) 最终冷却策略（v1.11，1.1.1）
+
+```cpp
+// OnCooldown() 龙吼分支 —— 只拦不清，一个引擎字段都不写
+const float remain = player->GetVoiceRecoveryTime();
+if (remain > 0.0f) return true;   // 冷却中：拦在换槽之前
+return false;
+```
+
+- 冷却时长完全由引擎按 `TESShout::variations[阶].recoveryTime` 计算，玩家减冷却属性/附魔正常生效。
+- **拦截必须在换槽之前**：`BeginNativeShout()` 是"先换槽、后喂事件"，若引擎拒绝则换出的槽无还原路径 → Z 槽永久污染。
+
+### D) 槽位还原的可靠传输协议（v1.12，1.1.1）
+
+- **故障实锤**（21:41:47）：`.493 [defer-restore] 延迟还原...` → `.587 [begin] 原 currentShout=0002F7BA → 换为第二槽=0002F7BA`（**仅 94ms**）
+  → 把借来的第二槽值记成"原始 Z 槽"，并覆盖上次未归还的真值 → **永久丢失**。
+- **根因**：`TryDeferredRestore()` 的 300ms 保护窗口（为让引擎异步结算读完 `currentShout`）内直接 return 不还原 →
+  快速连按时 `m_previousShout = high->currentShout` 记录到脏值。
+- **对策（ARQ / 停止-等待思想）**：
+  1. **停止-等待**：`m_restorePending` 为真时**拒绝**新施放（不允许两个在途事务）→ 记录原值时槽位必干净；
+  2. **写后校验**：还原写入后立即回读，确认 `currentShout`/`selectedPower` 真回到原值；
+  3. **有限重传**：未确认则下一帧重发，最多 8 次；**校验失败时不清空** `m_previousShout/m_previousPower`（重发要用）；
+  4. **超时降级**：沿用 3s 硬上限。
+- **实测**：修复后 88ms 连按被正确拒绝，`[begin] 上一轮槽位还原尚未确认（pending），本次 X 被拒绝…`，Z 槽完好。
+
+### E) 教训（写入 MEMORY §4 通用坑）
+
+> **凡是"读一个共享字段来判断其真假"的逻辑，都必须先证明该字段的独占性。**
+> v1.5 认为"插件空闲 + 字段非零 = 垃圾"，但该字段被 HUD 与引擎拦截共用且由引擎自己维护——
+> 任何一方私自清零，都会同时破坏显示与判定。宁可"只读+拦截"，绝不"猜测+清零"。

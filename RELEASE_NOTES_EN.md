@@ -1,6 +1,79 @@
-# Another Key for Shout (AKFS) — Release Notes 1.1.0
+# Another Key for Shout (AKFS) — Release Notes 1.1.1
 
 Target runtime: Skyrim SE 1.6.1170 (AE) · CommonLibSSE-NG + Address Library
+
+## Release 1.1.1 (internal v1.12) — 2026-10-20
+
+Reliability fixes for shout cooldown handling and slot restoration.
+These resolve three issues present in 1.1.0 and earlier.
+
+### 1) X-key shout had no cooldown ("phantom cooldown" root cause)
+
+- **Symptom**: casting a shout with X, then pressing X again immediately, still cast successfully —
+  while the in-game cooldown bar / message indicated the voice was still recovering.
+- **Root cause**: the "residual self-heal" logic added in v1.5 treated any `voiceRecoveryTime > 0`
+  while the plugin was "idle" as engine garbage and zeroed it. But **"plugin idle" is exactly the period
+  when a cooldown is legitimately running** (cast finished, slot restored) — so every genuine cooldown
+  was wiped the moment it started. The original judgement rested on the observation that "the engine never
+  writes this field (measured 0.00s)"; logs prove the engine **does** write it and the value counts down
+  naturally (35.65s written at 18:24:32 → 0.00s by 18:25:12). The very notion of a "phantom cooldown"
+  came from a wrong observation.
+- **Fix**: removed the zeroing and all related self-heal / marker / threshold logic. Only a single
+  read-only check remains — if `voiceRecoveryTime > 0`, block. **No engine field is written.**
+  Cooldown length is entirely computed by the engine from `TESShout::variations[level].recoveryTime`,
+  so player cooldown-reduction effects keep working, and the plugin no longer fights the HUD cooldown bar
+  over the same field.
+
+### 2) Pressing X during cooldown corrupted the Z-bound shout
+
+- **Symptom**: pressing X while a shout was cooling down changed the shout managed by the Z key into the
+  second-slot (X) shout, irreversibly (the Z selection was visibly changed in the shout menu).
+  Vanilla has only one Z slot, so this is an inherent risk of how this plugin hooks in.
+- **Root cause**: `BeginNativeShout()` **swaps the slots first and feeds the Z-key event afterwards**
+  (`currentShout` / `selectedPower` temporarily replaced with the second slot). If the engine then rejects
+  the cast, the swapped-in slots have **no restoration path** → permanent corruption.
+  Investigation also showed `ShoutHandler::CanProcess()` **does not perform a cooldown check**
+  (8/8 calls returned true, including samples taken at 16.19s / 33.92s / 27.25s of remaining cooldown),
+  so "ask CanProcess before swapping" cannot block the cooldown case.
+- **Fix**: the cooldown check now runs **before the slot swap** (shout branch of `OnCooldown()`);
+  during cooldown the plugin never enters the swap path. That branch is read-only and does not alter the
+  cooldown value. The `CanProcess` pre-check and the "did CanProcess touch the slots?" verification log are
+  kept as an additional defensive layer.
+
+### 3) Rapid double-press permanently lost the Z slot (subtle)
+
+- **Symptom**: very hard to reproduce. Pressing X again **before the previous cast had restored its slots**
+  recorded the then-current second-slot (X) shout as the "original Z slot", overwriting the real original
+  value that had not yet been returned → the Z selection was lost for good.
+- **Root cause**: `TryDeferredRestore()` has a 300 ms guard window (to let the engine finish its asynchronous
+  settlement while reading `currentShout`), and returns early inside it. On a rapid double-press
+  (measured 88–94 ms apart) `m_previousShout = high->currentShout` therefore captured the **borrowed**
+  second-slot value. Measured log:
+  `[defer-restore] deferred restore...` (21:41:47.493) → `[begin] prev currentShout=0002F7BA → swapped to slot2=0002F7BA`
+  (21:41:47.587, only 94 ms later).
+- **Fix**: slot restoration now uses a **reliable-delivery protocol** (borrowed from ARQ / stop-and-wait):
+  - **Stop-and-wait**: while `m_restorePending` is true, a new cast is **refused**, guaranteeing the slot is
+    clean at the moment the original value is recorded (eliminates both "dirty value recorded as original"
+    and "unreturned original overwritten");
+  - **Write-then-verify**: after writing, read back immediately and confirm `currentShout`/`selectedPower`
+    truly hold the original values, otherwise mark the transaction unacknowledged;
+  - **Bounded retransmission**: retry on the next frame, up to 8 times, then warn and give up;
+  - **Timeout fallback**: the existing 3 s hard cap is retained.
+- **Verified**: after the fix, a double-press with the same 88 ms gap is correctly refused, logging
+  `[begin] previous slot restore not yet confirmed (pending), this X rejected to avoid recording a dirty value`,
+  and the Z slot stayed intact.
+
+### Known trade-offs
+
+- On rapid double-presses the second X press is **ignored** while the previous restore completes.
+  This is the inherent cost of stop-and-wait, traded for "the Z slot is never lost".
+- Pressing X during cooldown is silent (no engine voice message).
+
+### Artifacts
+
+- `AKFS.dll` 653824 bytes; exports `SKSEPlugin_Load` / `SKSEPlugin_Query` / `SKSEPlugin_Version` verified.
+- Releases: `Another Key for Shout 1.1.1.zip` (English default), `Another Key for Shout 1.1.1_CHS.zip` (Chinese).
+- Source: `AKFS_source_1.1.1.zip`.
 
 ## Release 1.1.0 (internal v1.7) — 2026-10-19
 

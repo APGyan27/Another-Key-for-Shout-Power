@@ -81,6 +81,6 @@ Copy-Item "plugin/Another Key for Shout/Language/Chinese/AKFS.ini" "<游戏>\Dat
 
 ## 版本
 
-- 发布版本：**1.1.0**
-- 内部迭代号：v1.7
+- 发布版本：**1.1.1**
+- 内部迭代号：v1.12
 - 详见 [CHANGELOG.md](CHANGELOG.md)
